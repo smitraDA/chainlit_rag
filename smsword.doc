@@ -1,0 +1,347 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Courier New;}}
+\fs22
+# Chainlit Setup And AWS Deployment Guide\par
+\par
+This document captures the end-to-end setup used in this workspace:\par
+\par
+- local Chainlit installation\par
+- echo-mode validation\par
+- OpenAI-backed responses\par
+- AWS deployment on ECS Fargate\par
+- Bedrock Knowledge Bases integration\par
+\par
+## 1. Local installation\par
+\par
+Open a terminal in the project root and run:\par
+\par
+```bash\par
+pip install chainlit\par
+chainlit hello\par
+```\par
+\par
+If the hello app opens in the browser, Chainlit is installed correctly.\par
+\par
+For the latest development version from GitHub:\par
+\par
+```bash\par
+pip install git+https://github.com/Chainlit/chainlit.git#subdirectory=backend/\par
+```\par
+\par
+Note: the development version may require additional frontend tooling such as Node.js and pnpm.\par
+\par
+## 2. Minimal Chainlit app\par
+\par
+The project app lives in `demo.py`.\par
+\par
+Basic Chainlit pattern:\par
+\par
+```python\par
+import chainlit as cl\par
+\par
+@cl.on_message\par
+async def main(message: cl.Message):\par
+    await cl.Message(content=f"You said: \{message.content\}").send()\par
+```\par
+\par
+Run the app with:\par
+\par
+```bash\par
+chainlit run demo.py --host 0.0.0.0 --port 8000\par
+```\par
+\par
+## 3. Echo-mode setup used here\par
+\par
+The current app was set up in two phases.\par
+\par
+First, echo mode was used to verify that:\par
+\par
+- the Chainlit server starts\par
+- the browser can connect\par
+- a submitted message reaches the Python handler\par
+- the UI can render a response\par
+\par
+Echo mode is the fastest way to isolate transport issues from model issues.\par
+\par
+Current echo behavior:\par
+\par
+- if `OPENAI_API_KEY` is not set, the app replies with the user message\par
+- it also explains that the app is still in echo mode\par
+\par
+Example behavior:\par
+\par
+```text\par
+Echo mode: hello\par
+\par
+Set OPENAI_API_KEY to enable real model responses.\par
+```\par
+\par
+## 4. OpenAI-backed setup used here\par
+\par
+The current `demo.py` supports two runtime modes:\par
+\par
+1. Echo fallback when `OPENAI_API_KEY` is missing\par
+2. Real model responses when `OPENAI_API_KEY` is present\par
+\par
+Environment template in `.env.example`:\par
+\par
+```env\par
+OPENAI_API_KEY=your_openai_api_key_here\par
+OPENAI_MODEL=gpt-4.1-mini\par
+```\par
+\par
+How the app works:\par
+\par
+- `on_chat_start` checks whether OpenAI is configured\par
+- `on_message` falls back to echo mode if the API key is missing\par
+- otherwise it calls the OpenAI Responses API and returns the model output\par
+\par
+To enable model responses locally:\par
+\par
+```bash\par
+cp .env.example .env\par
+```\par
+\par
+Then edit `.env` and set a real key.\par
+\par
+After that, restart the app:\par
+\par
+```bash\par
+chainlit run demo.py --host 0.0.0.0 --port 8000\par
+```\par
+\par
+## 5. Why echo mode matters\par
+\par
+If the UI shows no answer at all, the problem is usually one of these:\par
+\par
+- the Chainlit server is not running\par
+- the browser cannot connect back to the server\par
+- the Python handler is not being triggered\par
+- the app is waiting on an external model call that is failing\par
+\par
+Echo mode removes the external model dependency and proves the request path is working.\par
+\par
+## 6. Recommended AWS deployment method\par
+\par
+For a Chainlit app, the recommended AWS deployment path is:\par
+\par
+1. Containerize the app\par
+2. Push the image to Amazon ECR\par
+3. Run it on Amazon ECS Fargate\par
+4. Expose it with an Application Load Balancer\par
+5. Store secrets in AWS Secrets Manager\par
+6. Use an ECS task role for Bedrock and other AWS access\par
+\par
+This is the preferred method because Chainlit is a long-running web app and benefits from a stable container runtime.\par
+\par
+## 7. Recommended AWS architecture\par
+\par
+```mermaid\par
+flowchart LR\par
+    U[Browser] --> ALB[Application Load Balancer]\par
+    ALB --> ECS[ECS Fargate running Chainlit]\par
+    ECS --> SM[Secrets Manager]\par
+    ECS --> CW[CloudWatch Logs]\par
+    ECS --> BKR[Bedrock Runtime]\par
+    ECS --> KB[Bedrock Knowledge Base]\par
+    KB --> OS[OpenSearch Serverless or vector store]\par
+    KB --> S3[S3 source documents]\par
+```\par
+\par
+## 8. Why ECS Fargate instead of Lambda\par
+\par
+Use ECS Fargate because:\par
+\par
+- Chainlit runs as a persistent web server\par
+- websocket-like interaction patterns are easier behind an ALB\par
+- container deployment is straightforward\par
+- task roles make AWS integration cleaner\par
+\par
+Avoid Lambda for the main Chainlit UI server unless you are deliberately redesigning the app around a serverless pattern.\par
+\par
+## 9. Bedrock Knowledge Bases integration method\par
+\par
+The simplest reliable method is to query Bedrock Knowledge Bases from the Chainlit message handler.\par
+\par
+Preferred first implementation:\par
+\par
+- use `bedrock-agent-runtime`\par
+- call `retrieve_and_generate`\par
+- return the generated answer to Chainlit\par
+\par
+Example pattern:\par
+\par
+```python\par
+import os\par
+import boto3\par
+\par
+bedrock_agent = boto3.client(\par
+    "bedrock-agent-runtime",\par
+    region_name=os.environ.get("AWS_REGION", "us-east-1"),\par
+)\par
+\par
+def ask_kb(user_query: str) -> str:\par
+    response = bedrock_agent.retrieve_and_generate(\par
+        input=\{"text": user_query\},\par
+        retrieveAndGenerateConfiguration=\{\par
+            "type": "KNOWLEDGE_BASE",\par
+            "knowledgeBaseConfiguration": \{\par
+                "knowledgeBaseId": os.environ["BEDROCK_KB_ID"],\par
+                "modelArn": os.environ["BEDROCK_MODEL_ARN"],\par
+            \},\par
+        \},\par
+    )\par
+    return response["output"]["text"]\par
+```\par
+\par
+Chainlit handler shape:\par
+\par
+```python\par
+import chainlit as cl\par
+\par
+@cl.on_message\par
+async def main(message: cl.Message):\par
+    answer = ask_kb(message.content)\par
+    await cl.Message(content=answer).send()\par
+```\par
+\par
+## 10. AWS prerequisites for Bedrock KB\par
+\par
+Before deployment, create and validate:\par
+\par
+1. A Bedrock Knowledge Base\par
+2. A data source for the KB\par
+3. Ingested documents\par
+4. A supported foundation model in the target region\par
+5. An ECS task role with Bedrock permissions\par
+\par
+Environment variables to provide:\par
+\par
+```env\par
+AWS_REGION=us-east-1\par
+BEDROCK_KB_ID=your_kb_id\par
+BEDROCK_MODEL_ARN=your_model_arn\par
+```\par
+\par
+## 11. IAM permissions for the ECS task role\par
+\par
+Grant the ECS task role at least:\par
+\par
+- `bedrock:Retrieve`\par
+- `bedrock:RetrieveAndGenerate`\par
+- `bedrock:InvokeModel`\par
+- `secretsmanager:GetSecretValue`\par
+- `logs:CreateLogStream`\par
+- `logs:PutLogEvents`\par
+\par
+If secrets are encrypted with a customer-managed KMS key, also allow KMS decrypt for that key.\par
+\par
+## 12. Containerization\par
+\par
+Example `Dockerfile`:\par
+\par
+```dockerfile\par
+FROM python:3.12-slim\par
+\par
+WORKDIR /app\par
+\par
+COPY requirements.txt .\par
+RUN pip install --no-cache-dir -r requirements.txt\par
+\par
+COPY . .\par
+\par
+EXPOSE 8000\par
+\par
+CMD ["chainlit", "run", "demo.py", "--host", "0.0.0.0", "--port", "8000"]\par
+```\par
+\par
+Example `requirements.txt` for the AWS KB variant:\par
+\par
+```txt\par
+chainlit\par
+boto3\par
+```\par
+\par
+If using OpenAI in the deployed version too:\par
+\par
+```txt\par
+chainlit\par
+boto3\par
+openai\par
+```\par
+\par
+## 13. ECS deployment steps\par
+\par
+1. Build the container image locally or in CI\par
+2. Push it to Amazon ECR\par
+3. Create an ECS task definition\par
+4. Attach the task role with Bedrock permissions\par
+5. Configure environment variables and Secrets Manager references\par
+6. Create an ECS Fargate service\par
+7. Attach the service to an ALB target group on port `8000`\par
+8. Configure health checks on `/`\par
+9. Review CloudWatch logs for startup and request handling\par
+\par
+Suggested starting capacity:\par
+\par
+- 0.5 vCPU\par
+- 1 GB RAM\par
+- 1 running task\par
+\par
+## 14. Networking guidance\par
+\par
+Recommended production layout:\par
+\par
+- public subnets for the ALB\par
+- private subnets for ECS tasks\par
+- NAT gateway or appropriate egress for AWS service access\par
+\par
+For a prototype, public tasks can work, but private tasks are the cleaner production approach.\par
+\par
+## 15. Secrets management\par
+\par
+Do not hardcode secrets in the repository.\par
+\par
+Use:\par
+\par
+- ECS task role for AWS credentials\par
+- AWS Secrets Manager for non-AWS secrets\par
+- environment variables for non-sensitive configuration\par
+\par
+For Bedrock usage inside ECS, prefer IAM task roles instead of static AWS access keys.\par
+\par
+## 16. Better RAG control pattern\par
+\par
+`retrieve_and_generate` is the fastest way to launch, but a more controllable pattern is:\par
+\par
+1. call `retrieve`\par
+2. inspect or filter chunks\par
+3. build your own prompt\par
+4. call `bedrock-runtime`\par
+5. return the answer with citations in Chainlit\par
+\par
+Use this pattern when you need stronger citation control, chunk inspection, or prompt customization.\par
+\par
+## 17. Practical rollout plan\par
+\par
+Recommended order of execution:\par
+\par
+1. Confirm echo mode locally\par
+2. Confirm OpenAI mode locally\par
+3. Replace the OpenAI path or add a Bedrock KB path\par
+4. Containerize the app\par
+5. Deploy to ECS Fargate\par
+6. Validate ALB access and logs\par
+7. Load test and refine task sizing\par
+\par
+## 18. Current workspace notes\par
+\par
+Current relevant local files:\par
+\par
+- `demo.py`\par
+- `.env.example`\par
+- `chainlit.md`\par
+\par
+The project also contains cloned upstream repositories under `Chainlit-org/`, but those are separate clones and not required for the local demo app itself.\par
+
+}
